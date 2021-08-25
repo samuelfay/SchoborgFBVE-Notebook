@@ -6,6 +6,10 @@
 
 This notebook provides background for the project and explains how volume is estimated for a fly brain. Then, I will go into the code structure while explaining which strategies worked and what I wasn't able to get working.
 
+## Contact
+
+If you have any questions about anything in this project, please feel free to contact me at smafay6 AT gmail.com. You can also contact Lars Kotthoff, the mentor of the project, at larsko AT uwyo.edu.
+
 ## Background
 
 Todd Schoborg is a professor in the Department of Molecular Biology at the University of Wyoming. He uses the fruit fly, Drosophila melanogaster, as a model organism to study particular genes involved in the control of brain growth. Mutations of these genes result in a small brain phenotype referred to as microcephaly. One useful metric in measuring the size of a fly's brain is its volume, which can be determined from micro-CT scans of the fly's head.
@@ -150,6 +154,13 @@ main() is only run if the file is explicitly ran. If it is just imported, then i
 
 The second snippet just converts a two flies to a folder for testing purposes. The third snippet converts a few images from some flies not in the training dataset that contain individual tif images rather than tif stacks. The fourth snippet gets the metadata for all of the flies in that same group that the third snippet dealt with. The fifth snippet was to test how exactly to perform noise reduction on some scans to see if it improved mask accuracy.
 
+At the end of the file is this bit of code:
+```python
+if __name__ == "__main__":
+    main()
+```
+`__name__` is a built in varaible in python. If the file is being run on its own, then the `__name__` will be `"__main__"`. If it's not being run alone, and is instead being imported into another file, then it will be the name of the file, which in this case is `"ImageManip"`.
+
 ### SEMANTIC2.py
 
 SEMANTIC2.py contains the code for the image segmentation neural network. Much of the code for the network comes straight from the Tensorflow Image Segmentation tutorial, which can be found [here](https://www.tensorflow.org/tutorials/images/segmentation). The architecture of the network remains the same apart from the resolution that the images are processed at, and what is changed is mainly how the images are loaded in, how the training data is processed, and the model being saved. I will mainly go over the functions that are modified and aren't straight from the tutorial. 
@@ -189,6 +200,235 @@ This function is a member of the `DisplayCallback` class which inherits from `tf
 #### unet_model(output_channels)
 
 One thing changed in this function from the tutorial is that the input shape for the `inputs` and `base_model` are changed to be 224x224, the largest resolution supported by this model. 
+
+#### predictImages(imageDirectory, outputDirectory)
+
+This function takes in an directory of images, reads them in, and predicts them using the model. It then outputs the masks as pngs into the output directory. The masks in the output directory have the same filename as the scan it comes from. The function prints how many images were written after it's done.
+
+#### main()
+
+Unlike ImageManip.py, SEMANTIC2.py does not have a main function that is only ran when we run this file explicitly because we always want to load in the model when we import this file. First are the important lines that describe whether we have a model that we want to load in, and what the name of that model is:
+```python
+hasModel = False
+modelPath = "5epochsegmentationmodel"
+```
+If `hasModel` is `True`, then we simply load in the model:
+```python
+if hasModel:
+    print("\nLoading Model...")
+    model = tf.keras.models.load_model(modelPath)
+```
+If `hasModel` is `False`, then we need to load in the data and train the model:
+```python
+else:
+    print("training new model")
+    print("\nloading data...")
+    dirMasks = '../3D\ Test\ Images/Masks'
+    dirScans = '../3D\ Test\ Images/Scans'
+    masks = pathlib.Path(dirMasks)
+    scans = pathlib.Path(dirScans)
+    masks = tf.data.Dataset.list_files((str(masks/'*.png')),shuffle=False)
+    scans = tf.data.Dataset.list_files((str(scans/'*.png')),shuffle=False)
+```
+If you remember from the main function in `ImageManip.py`, when we make the training data, we write it to `../3D Test Images/` directory. So, we convert those directories into a path from the `pathlib` library which allows us to do useful things like grab all sorts of files and iterate through the directory. In this case, we just use the `tf.data.Dataset` function to get all the png files from the mask and scan directories.
+```python
+    ds = tf.data.Dataset.zip(({"image":scans,"seg":masks}))
+    ds = ds.shuffle(BUFFER_SIZE,reshuffle_each_iteration=False)
+    # take the first 90% of the data and leave the last 10% for validation
+    train = ds.take(int(0.9*len(list(ds.as_numpy_iterator()))))
+    test = ds.skip(int(0.9*len(list(ds.as_numpy_iterator()))))
+    train = train.map(load_image_train,num_parallel_calls=AUTOTUNE)
+    test = test.map(load_image_test,num_parallel_calls=AUTOTUNE)
+```
+Because the images have a unique number in front of them, and the files are sorted alphanumerically, then all the images the masks and scans folder are in the same order. Therefore we can just zip the two datasets together, and the scans will be matched with what the desired output should be. Then, we take 90% of the data for the training dataset and leave the remaining 10% for validation testing. We then map the `load_image_train()` and `load_image_test()` functions to the two datasets, respectively. This will transform the datasets from just containing the filenames to actually having the rotated and normalized images. This can definitely be experimented with, as I don't know whether or not changing the `reshuffle_each_iteration` variable makes the scans get new random rotations every epoch, or whether the rotations persist throughout the whole training of the model.
+```python
+    train_batch = train.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+    train_batch = train_batch.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    test_batch = test.batch(BATCH_SIZE)
+    model = unet_model(OUTPUT_CHANNELS)
+    model.compile(optimizer='adam',loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),metrics=['accuracy'])
+```
+Then, we make shuffle the data set and split it up into batches. Then, the model is compiled. This line is straight from the tutorial.
+```python
+    EPOCHS = 5
+    VALIDATION_STEPS = 1
+    # uncomment if you want to show predictions before 1 epoch is run
+    # show_predictions()
+    model_history = model.fit(train_batch,epochs=EPOCHS,validation_data=test_batch,callbacks=[DisplayCallback()])
+    # save the newly trained model
+    model.save("5epochsegmentationmodel")
+    print("model saved \n")
+```
+Finally, we define the amount of epochs we use. I went with 5, as this is where the validation accuracy peaked and didn't really improve after that. Then, we train the model. Using GPUs on Teton, this takes about 2-3 minutes per epoch. I will get into the environment more in the Environment section.
+
+### VolumeFrom3D.py
+
+`VolumeFrom3D.py` is the file that ties `SEMANTIC2.py` and `ImageManip.py` together. After the library import statements, we import both files:
+```python
+ImageManip = importlib.import_module("ImageManip")
+SegmentationNetwork = importlib.import_module("SEMANTIC2")
+```
+We also use the pandas library to read in the csv file that contains the true volumes for the training data which has the masks that Todd hand-drew:
+```python
+df = pd.read_csv('../Brain Volume Measurements.csv')
+```
+
+#### getFlyTifLocations(parentDirectory, numberPerFlyType, getScan = True)
+
+This function takes in a parentDirectory with the format of the training data (`parentDirectory/flyType/flyNumber/scanOrMaskTifStack.tif`). It then iterates through all of the flies in the directory and returns a list of either the scan filepaths if `getScan` is `True` or the mask filepaths if `getScan` is `False`. `numberPerFlyType` refers to how many individuals from each fly type the user wants to pull. It's important to note that sometimes the order of the directory doesn't pull it in order numerically, so if there were 5 flies in a certain fly type and `numberPerFlyType` was 3, then it might return the file paths of flies `_02, _03, _04` but not `_01`.
+
+#### getFlyPngLocations(parentDirectory, numberPerFlyType, getScan = True)
+
+This function is slightly different than the previous function because it takes in a parent directory with the format `parentDirectory/flyType/flyNumber/[FolderNamedMasksOrScans]/`. Depending on the value of `getScan`, the function returns a list of filepaths leading to the `Scans/` or `Masks/` directory in the fly directories. 
+
+#### getOutputDirsFromFiles(tifList, outDirPrefix)
+
+Given a list of tif files in a directory formatted like the training data, this function returns a list of folders where the converted images from the tif file list could be stored within the `outDirPrefix`. If `outDirPrefix` is `../Test Images/`, and if the first element of `tifList` is a tif in fly `_04` from fly type `FL Del NLS1-3`, then the first element of the returned list would be `../Test Images/FL Del NLS1-3/_04/`.
+
+#### predictImages(flyPngDirList, outDirList)
+
+This function is basically a wrapper function for the `predictImages()` function in `SEMANTIC2.py`. The main difference is that it takes in a list of directories of fly PNG scans `flyPngDirList` and a list of output directories `outDirList`. It for an index `i`, it predicts the masks for all the images in `flyPngDirList[i]` and outputs the masks to a matching folder within `outDirList[i]`.
+
+#### getLabel(flyTypeAndNumber)
+
+This function gets the label (the correct volume number) for a given string `flyTypeAndNumber`. This string is just a concatenation of the fly's type and number, so `FL Del NLS1-3/_04` would be `flyTypeAndNumber = "FL Del NLS1-3_04"` The column for Genotype in the csv is where the fly name and number are stored in that format. Then, once we've selected the right row of data from the csv, which is the row for a specific fly, we read the `Brain Volume um^3 (Raw)` column and return that. In the CSV file, there is also a column for normalized volume. I have just used the raw volumes because the units for each pixel are in micrometers, so it was most simple to just estimate and work with the raw volumes. I'm not sure what the advantges or disadvantages of working with the normalized volume would be.
+
+#### calculateTotalSurfaceArea(flyMaskDirList, imageResolutions)
+
+This function takes in two parameters: `flyMaskDirList`, a list of directories that contain already predicted fly mask pngs, and `imageResolutions` a dictionary with keys of `flyTypeAndNumber`, and values of the original dimension square images. This is only one number, because they are squares. It is necessary to resize each mask to the resolution that it was originally at because they are all resized to the same resolution throughout the prediction process. 
+
+One thing this function returns is a list of lists called `individualCount`, where each internal list contains the individual pixel counts for each image. This is useful for comparing the predicted masks to the hand-drawn masks, and figuring out which images contain the largest errors. The function also returns `volumeDict`, a dictionary that has keys of the `flyTypeAndNumber` and values of the total cumulative pixels summed through all the images in one fly. I guess it really should be called `surfaceAreaDict` since it is total pixels, not the actual volume.
+
+#### calculateTotalSurfaceAreaFromTif(flyMaskDirList)
+
+Like the previous function, this function returns a `volumeDict` and an `individualCount` dictionary. However, it calculates the surface area from tif files, which are assumed to be the hand-drawn masks that Todd made, since the predicted masks are written to pngs, not tifs. Therefore, we don't have a dictionary of the images' original resolutions, since these files haven't had their resolution modified as they aren't being read into the network. We just count the amount of pixels in each image in the tif stack that are "on", and return volume and individual count dictionaries. 
+
+#### compareTotalMaskPixels(generatedMaskDirList, originalMaskFileList, imageResolutions, replicateWorstImages=False)
+
+This function is used to compare the pixels in the label masks and the predicted masks. It also has the optional parameter to replicate the worst image(s) from each fly, which set to be `False` at default. This functionality to replicate the worst images isn't finished. At the current stage, I am able to get the worst performing images and write them to file, however there may be bugs, and I haven't tested training the network on any replicated images. This is a strategy suggested by Lars to help improve the network with its tendency to underestimate the volume of brains. Lars suggested to not be afraid to replicate the images many times within the dataset, so you could make 10 identical images for each worst performing mask in each fly. 
+
+#### printPredictedAndActualVolumeTuples(predictedVolumeDict)
+
+This function takes in the predicted volume dictionary (although it should be called surface area dictionary as the number represents pixels). It then compares the predicted volumes to the actual volumes and the adjusted volumes. Adjusted volumes are the volumes where I try to take into account the network's tendency to underestimate. 
+
+First, we make a `predictedValue` for the volume by multiplying by the volume in micrometers that each pixel in the training set represents. For the training set, all the flies are taken at a resolution of 2.95 um^3 per pixel. Therefore, I multiply the volume by 2.95^3:
+```python
+predictedValue = value * 2.95 * 2.95 * 2.95
+```
+To try to see what the error would be with accounting for the tendency to underestimate, I summed the proportions, which are the `predictedValue / actualValue`, and divided by the total number of flies in order to get the average proportion. This proportion was about 0.87, so for every fly I get a `predictedAdjusted` value, which is 
+```python
+predictedAdjusted = predictedValue * (1/0.87286715585677)
+```
+I then sum up the error between the adjusted value and the actual value and print the average error. 
+
+#### main()
+
+main() is only run if the file is explicitly ran. If it is just imported, then it is not run and only the functions above are exposed. main() contains some commented code snippets that have brief descriptions in the code of what they do.
+
+##### Snippet #1
+
+The first snippet basically does the full function of this project from start to finish. It first reads in the locations of the tif scans and masks, then gets the directories that we will output all of the converted png scans to. Then, if something within the conversion process has changed, the line 
+```python
+#imageResolutions = ImageManip.convertToDifferentDirectories(tifScanList, outDirList)
+```
+can be uncommented, and every image will be converted to a png. However, if nothing within the conversion process has changed and the converted images are already in that directory, then this line is a lot of computation to just get a dictionary of the original image resolutions. Therefore, I stored this dictionary in a json file in the working directory called `training.json`. If the original resolution dictionary changes, then there is some commented out code to write the dictionary to file:
+```python
+#with open("training.json", "w") as outfile:
+#    json.dump(imageResolutions, outfile)
+```
+Since the dictionary is updated for the training set, the lines of code that are uncommented read the json file and store it in the `imageResolutions` dictionary:
+```python
+with open('training.json', 'r') as openfile:
+    # Reading from json file
+    imageResolutions = json.load(openfile)
+```
+Then, we make lists of where the png scans are and where we need to output the masks to. After that, there is a commented out line which predicts the scans and outputs them in the masks directory:
+```python
+#predictImages(pngDirList, outMaskDirList)
+```
+Predicting them also takes a long time. If you've changed something about how the network trains then it's necessary to repredict the images while changing the `hasModel` variable in `SEMANTIC.py` to `False` so that it retrains a new model when the code is compiled. For time purposes, I recommend using a teton node with a dedicated gpu. I will go into this more in the Environment section. 
+
+If you want to keep the same model, but something about the images are different then you can keep the `hasModel` variable to `True` while still running `predictImages()`, which will freshly predict the images in `pngDirList`.
+
+Lastly, we calculate the surface area for all the flies and print out stats about how accurate the volume estimation is:
+```python
+predictedDict = calculateTotalSurfaceArea(outMaskDirList, imageResolutions)[0]
+printPredictedAndActualVolumeTuples(predictedDict)
+```
+
+##### Snippet \#2
+
+The second snippet predicts the volume for 5 mutant flies that Todd supplied which are not in the training dataset. The process that it goes through is quite similar to Snippet \#1, except that it doesn't compare the actual volumes to the predicted volumes since the actual volumes are not known.
+
+##### Snippet \#3
+
+This snippet converts input scans into layered stacks to be used to try to estimate volume in the Regression network. It uses `ImageManip.getRandomStacks()` to select these stacks:
+```python
+ImageManip.getRandomStacks(outMaskDirList, 3, 5, 
+                            "../TestStacksForRegression/")
+```
+The 3 and 5 parameters mean that we want 5 random stacks of 3 images for each fly.
+
+##### Snippet \#4
+
+Some of the new flies that Todd gave us come in a slightly different format than the training data, where rather than having a tif stack of the scans, the scans are in individual images. This requires some slightly different processing, so this snippet provides an example of how to predict volumes for all of the flies in the `Angle 2` directory. These `Angle 2` flies are not computationally manipulated to be viewed from the exact same viewing angle for every fly. Instead, they contain the natural variation in viewing angle that happens when the scans are taken. This ability to detect brain in scans that aren't on the same angle as the training data is an important element of the network because it reduces the manual tasks that Todd has to do before inputting the scans into the program.
+
+### Regression.py
+
+This network was used as a second step in the project before I transitioned to calculating it based on the volume gotten from expanding every slice. After the scans were converted to masks, this network would receive a few images (scans or masks depending on the implementation) and estimate the volume based on those scans. I wasn't able to get it working well though, so it is not currently used.
+
+The general layout and many of the functions in this file are quite similar to `SEMANTIC2.py`. 
+`display()` displays some images for debugging purposes if you are running the code locally. 
+`get_label()` returns the relevant label from `BrainVolumeMeasurements.csv`. 
+`load_image()` loads in the image from a `tf.Dataset` datapoint and applies a rotation. It is used to load images for training.
+`loadImagesFromDisk()` load in the image from a file on disk. This is used for predicting images after training.
+`predictImages()` predicts images from a directory. At the moment it rotates the image and compares the rotated volume number to the non-rotated number to get an idea of performance.
+
+Before the data is loaded in, we set the random seed so that the shuffle of the training files is the same every time the network is run. This makes it so that there is no random variation in one training set being better or worse than another.
+
+The model inputs a (256,256,3) image and is made up of convolutional 2d transpose layers separated by pooling layers. Then, there is a flattening layer followed by 3 dense layers which end in a single number which is the volume estimation. I haven't experimented with changing the architecture of the network so far.
+
+There is also a similar `hasModel` Boolean variable that determines whether the model should be loaded or trained. 
+
+### Environment
+
+#### Teton
+
+For most of the time I have been working on this project I have been using the Teton High Performance Computing cluster. In order to be able to work on it, you need to be added to the SchoborgFBVE project. This will give you access to the project folder. At the moment, I have been working within the `/gscratch/sfay1` folder, which is my personal folder on Teton which I was working in before the SchoborgFBVE project was created. I will work on moving all of the images over to the `/project/SchoborgFBVE/` folder so that all of the files are accesible on teton to anyone on the project. It would be more convenient to do this over having you download the github repository, because the repository doesn't contain any images, and uploading the images takes a long time. Either way, if you need the images, there is a hard drive that has all of the training data on it, and a google drive folder which has all of the other fly images in it that I can share with you.
+
+For setting up the programming environment, the [wiki](https://arccwiki.atlassian.net/wiki/spaces/DOCUMENTAT/overview) is really helpful. The people who run ARCC are great, and nicely answered my dumb questions through email. You can email them at arcc-info@uwyo.edu. The main thing that I did to get my environment set up was to follow the [tensorflow tutorial](https://arccwiki.atlassian.net/wiki/spaces/DOCUMENTAT/pages/177209456/Using+TensorFlow). 
+
+One mistake I made with teton is I was running all the code and training the network on the login node, which is the computer that supports everyone logging in. This is a bad thing to do because there are many other nodes dedicated to doing the computing. Reading through all the wiki pages about the [SLURM workload manager](https://arccwiki.atlassian.net/wiki/spaces/DOCUMENTAT/pages/3113024/Slurm+Workload+Manager) was very helpful for me since I didn't have any previous experience with running jobs on a super powerful computer like Teton before. When needing to run code, I prefer to use an interactive session, which allows you to actually enter the terminal of the node that you are using to perform computations. The alternative to this is submitting a batch file with a job on it. The interactive sessions are very good for debugging, but submitting a batch job would be much easier for a process that is already streamlined.
+
+If I am just needing to do anything but training the network, then I make an allocated session without a gpu. The command I use looks like this, although the parameters can be tweaked to your liking:
+`salloc --account=schoborgfbve --time=3:00:00 --nodes=1 --ntasks-per-node=4 --mem=16G`
+
+If I do need to train the network, I request a gpu like this:
+`salloc --account=schoborgfbve --time=3:00:00 --nodes=1 --ntasks-per-node=1 --mem=16G --gres=gpu:1`
+Using a GPU cuts run time down hugely, like from 4 hours to 10 minutes to train the network. Using an interactive session allows you to keep track in real time of how far it is through training.
+
+After getting into the compute node, I runthe following commands to load into my tensorflow environment. These can also be found in the tensorflow tutorial on the wiki.
+`module load miniconda3
+module load cuda/10.1.243
+source activate tensorflow_env`
+
+Another important thing to note, is that when you want to run your code with a gpu, you need to prefix the command with `srun`. So, a command to use a GPU would look like:
+`srun python VolumeFrom3D.py`
+
+#### Connecting to Teton Through Your Local Environment
+
+It would be incredibly hard to edit all the code through a terminal, so to use an IDE on your local computer but still be in the Teton filesystem I use SSHFS, which stands for ssh file system. My work computer is a Mac, so I installed SSHFS from [here](https://osxfuse.github.io/). SSHFS allows you to mount a remote directory onto your local system. It doesn't load everything in immediately, so navigating to directories that have images can take a while for them to load. This is the reason why I made the `Test Images/` directory, which has the images in different folders for each fly. If I tried to access a folder with thousands of images in it, it would never load. An article explaining more about how SSHFS works can be found [here](https://www.redhat.com/sysadmin/sshfs).
+
+The command I use to connect to my `gscratch` directory on Teton is 
+`sshfs -o allow_other,default_permissions sfay1@teton.arcc.uwyo.edu:/gscratch/sfay1/CNNProject mnt/teton/`
+
+After you are done for the day, if you turn your computer off and sshfs disconnects, the remote directory remains mounted in your system, but it doesn't work. This is why I would recommend running the command `umount -f mnt/teton` to remove the remote directory from your pc, so that there are no hang ups when you attempt to connect to the remote directory again the next day.
+
+Following what Holden used, I have used [Spyder](https://www.spyder-ide.org/) as my IDE. It has worked well, I have no complaints. 
+
+If you have any other questions about the environment, please contact me at smafay6 AT gmail.com.
+
+
 
 
 ```python
